@@ -1,0 +1,8 @@
+numpy
+torch
+transformers
+gradio
+python-docx
+pdfplumber
+rank-bm25
+
