@@ -1,158 +1,331 @@
+"""
+Document Retrieval QA — Gradio app for Hugging Face Spaces.
+
+BM25 retrieves the most relevant text chunks from uploaded documents; a fine-tuned
+RoBERTa extractive QA model answers using those chunks as context.
+"""
+
+from __future__ import annotations
+
+import logging
 import os
-from rank_bm25 import BM25Okapi
-from transformers import pipeline, AutoTokenizer, AutoModelForQuestionAnswering
-import torch
+import re
+from typing import Any
+
 import gradio as gr
-from docx import Document
 import pdfplumber
+import torch
+from docx import Document
+from rank_bm25 import BM25Okapi
+from transformers import AutoModelForQuestionAnswering, AutoTokenizer, pipeline
 
-# Load the fine-tuned BERT-based QA model and tokenizer
-model_name = "IProject-10/roberta-base-finetuned-squad2"  # Replace with your model name
-qa_model = AutoModelForQuestionAnswering.from_pretrained(model_name)
-tokenizer = AutoTokenizer.from_pretrained(model_name)
+# -----------------------------------------------------------------------------
+# Configuration
+# -----------------------------------------------------------------------------
+MODEL_NAME = "IProject-10/roberta-base-finetuned-squad2"
+TOP_K_CHUNKS = 5
+MAX_CHUNK_CHARS = 1800  # Roughly bounded context for RoBERTa-style models on CPU/GPU Spaces
+ALLOWED_EXTENSIONS = {".txt", ".docx", ".pdf"}
 
-# Set up the device for BERT
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# -----------------------------------------------------------------------------
+# Model load (startup)
+# -----------------------------------------------------------------------------
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
+qa_model = AutoModelForQuestionAnswering.from_pretrained(MODEL_NAME)
 qa_model.to(device)
 qa_model.eval()
 
-# Create a pipeline for retrieval-augmented QA
+_pipeline_device = device.index if device.type == "cuda" else -1
 retrieval_qa_pipeline = pipeline(
     "question-answering",
     model=qa_model,
     tokenizer=tokenizer,
-    device=device.index if torch.cuda.is_available() else -1
+    device=_pipeline_device,
 )
 
-def extract_text_from_file(file):
-    # Determine the file extension
-    file_extension = os.path.splitext(file.name)[1].lower()
-    text = ""
 
+def extract_text_from_file(path: str) -> str:
+    """Read plaintext from a supported file path. Raises ValueError on failure."""
+    ext = os.path.splitext(path)[1].lower()
+    if ext not in ALLOWED_EXTENSIONS:
+        raise ValueError(
+            f"Unsupported file format {ext or '(none)'}. "
+            f"Use: {', '.join(sorted(ALLOWED_EXTENSIONS))}"
+        )
+
+    if ext == ".txt":
+        with open(path, "r", encoding="utf-8", errors="replace") as handle:
+            return handle.read()
+
+    if ext == ".docx":
+        document = Document(path)
+        parts = [p.text for p in document.paragraphs if p.text and p.text.strip()]
+        return "\n".join(parts)
+
+    if ext == ".pdf":
+        fragments: list[str] = []
+        with pdfplumber.open(path) as pdf:
+            for page in pdf.pages:
+                page_text = page.extract_text()
+                fragments.append(page_text if page_text else "")
+        return "\n".join(fragments)
+
+    raise ValueError(f"Unhandled extension: {ext}")
+
+
+def split_into_chunks(text: str, max_chars: int = MAX_CHUNK_CHARS) -> list[str]:
+    """Split document text into overlapping chunks for BM25 + QA."""
+    cleaned = text.strip()
+    if not cleaned:
+        return []
+
+    paragraphs = [p.strip() for p in re.split(r"\n\s*\n", cleaned) if p.strip()]
+    if not paragraphs:
+        paragraphs = [cleaned]
+
+    chunks: list[str] = []
+    overlap = max(80, max_chars // 10)
+
+    for para in paragraphs:
+        if len(para) <= max_chars:
+            chunks.append(para)
+            continue
+        start = 0
+        while start < len(para):
+            end = min(start + max_chars, len(para))
+            chunks.append(para[start:end])
+            if end >= len(para):
+                break
+            start = max(end - overlap, start + 1)
+
+    seen: set[str] = set()
+    unique: list[str] = []
+    for ch in chunks:
+        key = ch.strip()
+        if key and key not in seen:
+            seen.add(key)
+            unique.append(ch)
+    return unique
+
+
+def load_chunks_from_files(files: list[Any]) -> tuple[list[str], list[str]]:
+    """
+    Returns (chunks, warnings). Each file expands to one or more chunks.
+    Warnings aggregate non-fatal issues (empty file text, unknown names).
+    """
+    if not files:
+        raise ValueError("Please upload at least one document.")
+
+    chunks: list[str] = []
+    warnings: list[str] = []
+
+    file_list = list(files)
+    for file_obj in file_list:
+        path = getattr(file_obj, "name", None)
+        raw_name = getattr(file_obj, "orig_name", None) or getattr(file_obj, "name", "upload")
+        if not path:
+            warnings.append(f"Skipped an upload with no readable path ({raw_name}).")
+            continue
+
+        try:
+            text = extract_text_from_file(path).strip()
+        except (OSError, ValueError, Exception) as exc:  # pdfplumber / docx can raise varied errors
+            logger.exception("Failed to read %s", path)
+            raise ValueError(f"Could not read “{raw_name}”: {exc}") from exc
+
+        if not text:
+            warnings.append(f"No extractable text in “{raw_name}”.")
+            continue
+
+        file_chunks = split_into_chunks(text)
+        if not file_chunks:
+            warnings.append(f"No chunks produced from “{raw_name}” after processing.")
+            continue
+        chunks.extend(file_chunks)
+
+    if not chunks:
+        raise ValueError(
+            "No text could be extracted from your uploads. "
+            "Try a different PDF (text-based), .txt, or .docx file."
+        )
+
+    return chunks, warnings
+
+
+_WHITESPACE = re.compile(r"\s+")
+
+
+def run_qa_on_passage(question: str, passage: str) -> dict[str, Any]:
+    """
+    Invoke the QA pipeline with kwargs that exist across common transformers versions.
+
+    Older stacks may not support Squad2-only flags like handle_impossible_answer.
+    """
+    base = {"question": question, "context": passage, "truncation": True}
     try:
-        if file_extension == ".txt":
-            with open(file.name, "r") as f:
-                text = f.read()
-        elif file_extension == ".docx":
-            doc = Document(file.name)
-            for para in doc.paragraphs:
-                text += para.text + "\n"
-        elif file_extension == ".pdf":
-            with pdfplumber.open(file.name) as pdf:
-                for page in pdf.pages:
-                    text += page.extract_text() + "\n"
-        else:
-            raise ValueError("Unsupported file format: {}".format(file_extension))
-    except Exception as e:
-        text = str(e)
-    return text
+        out = retrieval_qa_pipeline(
+            **base,
+            max_answer_len=64,
+            top_k=1,
+            handle_impossible_answer=True,
+        )
+    except TypeError:
+        out = retrieval_qa_pipeline(**base)
+    return out[0] if isinstance(out, list) else out
 
-def load_passages(files):
-    passages = []
-    for file in files:
-        passage = extract_text_from_file(file)
-        passages.append(passage)
-    return passages
 
-def highlight_answer(context, answer):
-    start_index = context.find(answer)
-    if start_index != -1:
-        end_index = start_index + len(answer)
-        highlighted_context = f"{context[:start_index]}_________<<{context[start_index:end_index]}>>_________{context[end_index:]}"
-        return highlighted_context
-    else:
+def highlight_answer(context: str, answer: str) -> str:
+    """Mark the extracted span in context when an exact substring match exists."""
+    if not answer.strip():
         return context
 
-def answer_question(question, files):
+    idx = context.find(answer)
+    if idx != -1:
+        end = idx + len(answer)
+        return (
+            f"{context[:idx]}━━━━━━━━ «{context[idx:end]}» ━━━━━━━━{context[end:]}"
+        )
+
+    norm_ctx = _WHITESPACE.sub(" ", context)
+    norm_ans = _WHITESPACE.sub(" ", answer.strip())
+    if norm_ans and norm_ans in norm_ctx:
+        return (
+            context
+            + "\n\n*(Answer spans may differ slightly from source whitespace; "
+            "see Answer field.)*"
+        )
+
+    return context + "\n\n*(Could not align answer span in context text.)*"
+
+
+def answer_question(question: str, files: list[Any] | None):
+    """Run BM25 retrieval + extractive QA. Returns answer, highlighted context, score summary."""
+    if files is None:
+        files = []
+
+    warn_prefix = ""
+
     try:
-        # Load passages from the uploaded files
-        passages = load_passages(files)
+        q = (question or "").strip()
+        if not q:
+            raise ValueError("Please enter a question.")
 
-        # Create an index using BM25
-        bm25 = BM25Okapi([passage.split() for passage in passages])
+        if files is not None and not isinstance(files, list):
+            files = [files]
 
-        # Retrieve relevant passages using BM25
-        tokenized_query = question.split()
-        candidate_passages = bm25.get_top_n(tokenized_query, passages, n=3)
-        bm25_scores = bm25.get_scores(tokenized_query)
+        passages, warns = load_chunks_from_files(files)
+        if warns:
+            warn_prefix = "**Note:** " + " ".join(warns) + "\n\n"
 
-        # Extract answer using the pipeline for each candidate passage
-        answers_with_context = []
+        bm25 = BM25Okapi([p.split() for p in passages])
+        tokenized_query = q.split()
+        candidate_passages = bm25.get_top_n(tokenized_query, passages, n=min(TOP_K_CHUNKS, len(passages)))
+
+        bm25_scores_map: dict[int, float] = {
+            idx: float(score)
+            for idx, score in enumerate(bm25.get_scores(tokenized_query))
+        }
+
+        best: dict[str, Any] | None = None
+
         for passage in candidate_passages:
-            answer = retrieval_qa_pipeline(question=question, context=passage)
-            bm25_score = bm25_scores[passages.index(passage)]
-            answer_with_context = {
+            qa_out = run_qa_on_passage(q, passage)
+
+            qa_score = float(qa_out.get("score", 0.0))
+            passage_idx = passages.index(passage)
+            bm25_score = bm25_scores_map.get(passage_idx, 0.0)
+
+            row = {
                 "context": passage,
-                "answer": answer["answer"],
-                "BM25-score": bm25_score  # BM25 confidence score for this passage
+                "answer": (qa_out.get("answer") or "").strip(),
+                "qa_score": qa_score,
+                "bm25_score": bm25_score,
             }
-            answers_with_context.append(answer_with_context)
 
-        # Choose the answer with the highest model confidence score
-        best_answer = max(answers_with_context, key=lambda x: x["BM25-score"])
+            if best is None:
+                best = row
+                continue
 
-        # Highlight the answer in the context
-        highlighted_context = highlight_answer(best_answer["context"], best_answer["answer"])
+            if (row["qa_score"], row["bm25_score"]) > (best["qa_score"], best["bm25_score"]):
+                best = row
 
-        return best_answer["answer"], highlighted_context, best_answer["BM25-score"]
-    except Exception as e:
-        return str(e), "", ""
+        assert best is not None
 
-# Description
-md = """
-### Brief Overview of the project:
+        answer_text = best["answer"] or "(No span found in top passages; try rephrasing or uploading more relevant text.)"
+        highlighted = highlight_answer(best["context"], best["answer"])
+        scores_md = (
+            f"QA confidence: **{best['qa_score']:.4f}** · "
+            f"BM25 (chunk): **{best['bm25_score']:.4f}**"
+        )
 
-A Document-Retrieval QA application built by training **[RoBERTa model](https://arxiv.org/pdf/1907.11692)** on **[SQuAD 2.0](https://rajpurkar.github.io/SQuAD-explorer/)** dataset for efficient answer extraction and
-the system is augmented by using NLP based **[BM25](https://www.researchgate.net/publication/220613776_The_Probabilistic_Relevance_Framework_BM25_and_Beyond)** retriever for information retrieval from a large text corpus.
-The project is a brief enhancement and augmentation to the work done in the research paper **Encoder-based LLMs: Building QA systems and Comparative Analysis**.
-In this paper we study about BERT and its advanced variants and learn to build an efficient answer extraction QA system from scratch.
-The built system can be used in information retrieval system and search engines.
+        return warn_prefix + answer_text, highlighted, scores_md
 
-**Objectives of the projects:**
-1. Build a simple Answer Extraction QA system using **RoBERTa-base**: The project is deployed public url objective1.
-2. Building a Information Retrieval system for data augmentation using **BM25**
-3. **Document Retrieval QA** system by merging Answer Extraction QA system and Information retrieval system
+    except ValueError as err:
+        return str(err), "", ""
+    except Exception as exc:
+        logger.exception("Unexpected error during QA")
+        return f"Something went wrong: {exc}", "", ""
 
-### Demonstrating working of the Application:
 
-<div style="text-align: center;">
-    <img src="https://i.imgur.com/oYg8y7N.jpeg" alt="Description Image" style="border: 2px solid #000; border-radius: 5px; width: 600px; height: auto; display: block; margin: 0 auto;">
-</div>
+# -----------------------------------------------------------------------------
+# Gradio UI (Hugging Face Spaces)
+# -----------------------------------------------------------------------------
+DESCRIPTION_MD = """
+### Document Retrieval QA
 
-**Key Features:**
-- Fine-tuned **RoBERTa**- Performs **Answer Extraction** from the retrieved document
-- **BM25** Retriever- Performs **Information Retrieval** from the text corpus
-- Provides answers with **highlighted context**.
-- Application displays accurate **answer**, most relevant document **context** and the corresponding **BM25 score** of the passage to the user
+This demo combines **BM25 retrieval** over your uploaded documents with **extractive QA**
+using a **[RoBERTa-base](https://arxiv.org/pdf/1907.11692) model fine-tuned on [SQuAD 2.0](https://rajpurkar.github.io/SQuAD-explorer/)**
+([model card](https://huggingface.co/IProject-10/roberta-base-finetuned-squad2)).
 
-**How to Use:**
-1. Upload your corpus document(s).
-2. Enter your question in the text box followed by a question mark(?).
-3. Get the answer with context and corresponding BM25 scores.
+**How it works**
+1. Your files are split into chunks so long PDFs/DOCX files work better with the retriever.
+2. BM25 picks the **top passages** matching your question.
+3. The QA model selects an **answer span** from those passages.
+
+**Tips**
+- Use clear, specific questions (a question mark is optional).
+- For best results, upload documents that actually contain the answer.
+
+**Credits**
+Derived from coursework on encoder-based QA and retrieval; related to the theme of the paper *Encoder-based LLMs: Building QA systems and Comparative Analysis*.
 """
 
-# Define Gradio interface
-iface = gr.Interface(
-    fn=answer_question,
-    inputs=[
-        gr.Textbox(lines=2, placeholder="Enter your question here...", label="Question"),
-        gr.Files(label="Upload text, Word, or PDF files")
-    ],
-    outputs=[
-        gr.Textbox(label="Answer"),
-        gr.Textbox(label="Context"),
-        gr.Textbox(label="BM25 Score")
-    ],
-    title="Document Retrieval Question Answering Application",
-    description=md,
-    css="""
-    .container { max-width: 800px; margin: auto; }
-    .interface-title { font-family: Arial, sans-serif; font-size: 24px; font-weight: bold; }
-    .interface-description { font-family: Arial, sans-serif; font-size: 16px; margin-bottom: 20px; }
-    .input-textbox, .output-textbox { font-family: Arial, sans-serif; font-size: 14px; }
-    .error { color: red; font-family: Arial, sans-serif; font-size: 14px; }
-    """
+theme = gr.themes.Soft(
+    primary_hue=gr.themes.Color(c50="#eef2ff", c100="#e0e7ff", c200="#c7d2fe", c300="#a5b4fc", c400="#818cf8", c500="#6366f1", c600="#4f46e5", c700="#4338ca", c800="#3730a3", c900="#312e81", c950="#1e1b4b"),
+    font=[gr.themes.GoogleFont("Inter"), "ui-sans-serif", "system-ui", "sans-serif"],
 )
 
-# Launch the interface
-iface.launch()
+demo = gr.Interface(
+    fn=answer_question,
+    inputs=[
+        gr.Textbox(
+            lines=2,
+            placeholder='e.g. "What year was the merger announced?"',
+            label="Question",
+        ),
+        gr.Files(
+            label="Documents",
+            file_count="multiple",
+            file_types=[".txt", ".pdf", ".docx"],
+        ),
+    ],
+    outputs=[
+        gr.Markdown(label="Answer"),
+        gr.Textbox(label="Retrieved passage (context)", lines=14, max_lines=20),
+        gr.Markdown(label="Scores"),
+    ],
+    title="Document Retrieval QA",
+    description=DESCRIPTION_MD,
+    theme=theme,
+    css="""
+        .contain { max-width: 920px !important; margin: auto !important; }
+        footer {visibility: hidden}
+    """,
+)
+
+if __name__ == "__main__":
+    demo.queue(max_size=16).launch(server_name="0.0.0.0", server_port=7860)
